@@ -1,0 +1,30 @@
+{
+  "client": "Harbor Logistics",
+  "title": "Request for Proposal: Warehouse Management System Integration",
+  "issued": "2026-09-01",
+  "due": "2026-09-15",
+  "evaluation_criteria": [
+    { "id": "approach", "label": "Technical approach and understanding", "weight": 30 },
+    { "id": "team", "label": "Team and relevant experience", "weight": 20 },
+    { "id": "price", "label": "Price and value", "weight": 30 },
+    { "id": "risk", "label": "Risk management and delivery confidence", "weight": 20 }
+  ],
+  "pages": [
+    {
+      "page": 1,
+      "text": "1. Background\nHarbor Logistics operates four regional warehouses and a fleet of 60 vehicles serving 400 retail and wholesale customers. We are replacing our legacy warehouse management system with Cortex WMS in Q1 2027 and require an integration partner.\n\n2. Objectives\nThe selected vendor will integrate Cortex WMS with our ERP (NetSuite), three carrier APIs, and our customer portal, and migrate historical inventory data.\n\n3. Scope of work\nR1. The vendor must integrate Cortex WMS with NetSuite for purchase orders, sales orders, inventory levels and goods receipts, with near real-time synchronisation (under 5 minutes).\nR2. The vendor must integrate Cortex WMS with our three carrier APIs (Coastal Express, Meridian Freight, Northgate Parcel) for label generation, tracking and proof of delivery.\nR3. The vendor must migrate 5 years of historical inventory and order data from the legacy system, with reconciliation reports.\nR4. The vendor must deliver a customer portal integration so customers can see order status and tracking in real time."
+    },
+    {
+      "page": 2,
+      "text": "R5. The vendor should provide a monitoring dashboard for integration health with alerting to our operations team.\nR6. The vendor should provide training for 12 warehouse supervisors and 4 IT staff.\nR7. The vendor should provide 90 days of hypercare support after go-live.\nR8. The vendor may propose an optional returns-management workflow.\nR9. The vendor may propose an optional analytics layer over the integrated data.\n\n4. Timeline\nThe integration must be live before 31 March 2027. Data migration must complete two weeks before go-live.\n\n5. Constraints\nR10. All data must remain within our region; no data may be processed outside it.\nR11. The vendor must use our existing SSO for all user-facing components.\nR12. Vendor staff on site must hold valid warehouse safety certification."
+    },
+    {
+      "page": 3,
+      "text": "6. Evaluation criteria\nProposals will be scored on: technical approach and understanding (30%), team and relevant experience (20%), price and value (30%), risk management and delivery confidence (20%).\n\n7. Proposal format\nProposals must respond to each numbered requirement in order, state all assumptions, and include a fixed price with an optional time-and-materials rate for change requests. Case studies of comparable work are welcome.\n\n8. Questions\nQuestions may be submitted until 10 September 2026 to procurement@harborlogistics.example."
+    },
+    {
+      "page": 4,
+      "text": "9. Draft contract terms\n9.1 The vendor shall be liable without limit for any loss arising from the services, including consequential loss.\n9.2 Payment terms are 90 days from invoice.\n9.3 Harbor Logistics may terminate for convenience with 10 days notice.\n9.4 The vendor shall assign all intellectual property in deliverables to Harbor Logistics, including pre-existing tools.\n9.5 Service credits of 5% of the monthly fee apply for each hour of integration downtime during business hours."
+    }
+  ]
+}

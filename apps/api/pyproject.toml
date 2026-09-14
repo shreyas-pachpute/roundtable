@@ -1,0 +1,25 @@
+[project]
+name = "roundtable"
+version = "0.1.0"
+description = "A multi-agent proposal team: send it an RFP, get back a proposal, a price, the risks and the minutes."
+requires-python = ">=3.11"
+dependencies = [
+  "anthropic>=1.5",
+  "langgraph>=1.0",
+  "fastapi>=0.111",
+  "uvicorn[standard]>=0.30",
+  "sse-starlette>=2.0",
+  "pydantic>=2.7",
+  "pyyaml>=6.0",
+]
+
+[project.scripts]
+roundtable-api = "roundtable.main:run"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["roundtable*"]

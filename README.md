@@ -4,7 +4,7 @@
 
 Responding to a request for proposal is a team sport: someone researches the client, someone scopes the work, someone estimates, someone prices, someone checks the contract terms, someone writes, and someone tears the draft apart before it goes out. It takes a week and the best people in the company. Roundtable is that team as nine AI agents around one table: they work in parallel, hand work to each other through typed messages, object to each other with evidence, and a Chair keeps the meeting moving until the proposal is done or a human is needed.
 
-> **Status: building in public.** Phase 0 of 5. This repository is a plan being executed in the open; nothing runs yet. The collaboration protocol, the agents, the architecture and the evaluation strategy are in [`docs/`](docs/). Progress is tracked in the [issues](../../issues).
+> **Status: v0 runs.** The Harbor Logistics meeting runs end to end on your machine: all nine seats, fan-out estimation with a flagged disagreement, price and risk in parallel, six drafted sections, objections with evidence, a defence, an Arbiter's ruling, two clauses escalated to your seat, and the five deliverables. Bring your own key (Anthropic, or any OpenAI-compatible endpoint such as vLLM) from the settings panel, or run the keyless mock to see the mechanics. See [Running it](#running-it). What is still a plan is in [`docs/PLAN.md`](docs/PLAN.md) and the [issues](../../issues).
 
 Built by [Shreyas Pachpute](https://shreyaspachpute.in). Sister project of [Dispatch](https://github.com/shreyas-pachpute/dispatch), which is about running a back office; Roundtable is about agents *deliberating*. MIT licensed.
 
@@ -117,15 +117,32 @@ flowchart TB
 
 Detailed plan with definition of done per phase: [`docs/PLAN.md`](docs/PLAN.md).
 
-- [ ] **Phase 0 · Foundations** — blackboard, message bus and transcript, supervisor skeleton, meeting room shell, tracing, CI
-- [ ] **Phase 1 · Brief and research** — RFP ingestion, requirements matrix with citations, Researcher, Scoper
-- [ ] **Phase 2 · Estimate and price** — Estimator with fan-out/fan-in, Pricer with policy and memory, consistency checks
-- [ ] **Phase 3 · Write, critique, reconcile** — Writer, Risk, Critic, objection protocol, Arbiter, human join-in
-- [ ] **Phase 4 · Deliverables and hardening** — exports, minutes, evals as a CI gate, cost budgets, vLLM path, demo recording
+- [x] **v0 · vertical slice** — every seat, the blackboard, the bus, fan-out estimation, objections, Arbiter, human seat, meeting room, bring-your-own-key; SQLite, JSON RFP, Markdown outputs
+- [ ] **Phase 0 · Foundations** — Postgres, tracing to Langfuse, CI, recorded-meeting replay
+- [ ] **Phase 1 · Brief and research** — PDF/DOCX ingestion with OCR, web research through the model's server-side tool, brief evals
+- [ ] **Phase 2 · Estimate and price** — past-deal memory in pgvector, dual estimates by value threshold, numbers evals
+- [ ] **Phase 3 · Write, critique, reconcile** — re-entry into earlier rounds, override and veto from the seat, meeting evals
+- [ ] **Phase 4 · Deliverables and hardening** — DOCX and PDF exports, evals as a CI gate, cost budgets, quick-quote variant, demo recording
 
 ## Running it
 
-Not yet. Phase 0 delivers `docker compose up` and `make meeting` on the Harbor Logistics RFP.
+Python 3.11+ and Node 20+. No database server; v0 uses SQLite in `data/runtime/`.
+
+```bash
+git clone https://github.com/shreyas-pachpute/roundtable && cd roundtable
+make install            # pip install -e apps/api · npm install in apps/meeting-room
+
+# terminal 1
+make api                # http://127.0.0.1:8788
+# terminal 2
+make ui                 # http://localhost:3101
+```
+
+Open the meeting room and press **Open the meeting**. The agenda advances round by round; the seats light up as agents take turns; the transcript shows every assignment, delivery, objection, defence and ruling; the blackboard tabs fill with the requirements matrix, findings, packages, estimates (with the second estimate where one was requested), the price with its margin, the risk register, the draft with version numbers, the Critic's scores and objections, and finally the outputs, which you can download. When a clause must be declined per the playbook, or the Arbiter escalates, the meeting pauses and **Your seat** appears with the options; the minutes record what you chose.
+
+**Bring your own model.** Click the model button in the header: choose Anthropic (Opus 5 for the Chair, Critic and Arbiter and Sonnet 5 for the rest, or one model for everything), or any OpenAI-compatible endpoint with its base URL, paste your key, and press *Save and test*. The key stays in the API process's memory for the session; it is never written to disk. Without a key the demo runs on a deterministic mock so the mechanics are visible; the UI labels it as mock.
+
+**What v0 is and is not.** It is the real protocol at small scale: an owned, versioned blackboard; a typed bus whose transcript is the minutes; rounds with limits; fan-out and fan-in; objections that are rejected before they cost a turn if they carry no evidence; a defence, an Arbiter, a human seat; prices computed in code from the rate card with the model deciding only cited deviations; verbatim quotes validated against the RFP. It is not yet Postgres, PDF ingestion and OCR, the DOCX/PDF exports, the eval suites in CI, or re-entry into earlier rounds; those are the open phases in the plan.
 
 ## License
 

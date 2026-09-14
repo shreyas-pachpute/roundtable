@@ -28,3 +28,9 @@ evals/reports/*.json
 Thumbs.db
 .idea/
 .vscode/
+
+# next
+next-env.d.ts
+*.tsbuildinfo
+AGENTS.md
+CLAUDE.md
