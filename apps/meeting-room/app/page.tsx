@@ -97,7 +97,18 @@ export default function MeetingRoom() {
 
   const start = async () => { const r = await api("/api/meetings", { method: "POST" }); setLive([]); setMid(r.id); };
   const reset = async () => { await api("/api/demo/reset", { method: "POST" }); setMid(null); setData(null); setLive([]); };
-  const settle = async (decision: string) => { if (!mid) return; await api(`/api/meetings/${mid}/human`, { method: "POST", body: JSON.stringify({ decision, note }) }); setNote(""); refresh(mid); };
+  const [settleError, setSettleError] = useState<string | null>(null);
+  const settle = async (decision: string) => {
+    if (!mid) return;
+    try {
+      await api(`/api/meetings/${mid}/human`, { method: "POST", body: JSON.stringify({ decision, note }) });
+      setNote("");
+      setSettleError(null);
+    } catch (e: any) {
+      setSettleError(String(e.message ?? e));
+    }
+    refresh(mid);
+  };
 
   return (
     <>
@@ -163,6 +174,7 @@ export default function MeetingRoom() {
               <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
                 {waiting.options.map((o, i) => <button key={o} className={`btn sm ${i === 0 ? "primary" : ""}`} onClick={() => settle(o)}>{o}</button>)}
               </div>
+              {settleError ? <div className="note" style={{ color: "var(--bad)", marginTop: 6 }}>{settleError}</div> : null}
             </div>
           ) : null}
           <div className="card" style={{ flex: 1, minHeight: 400, display: "flex", flexDirection: "column" }}>
