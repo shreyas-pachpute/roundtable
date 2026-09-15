@@ -1,0 +1,29 @@
+# One-click deploy on Render: https://render.com/deploy?repo=https://github.com/shreyas-pachpute/roundtable
+# The API runs in mock mode until a key is set in the UI (or ANTHROPIC_API_KEY here).
+services:
+  - type: web
+    name: roundtable-api
+    runtime: docker
+    dockerfilePath: apps/api/Dockerfile
+    dockerContext: .
+    plan: free
+    envVars:
+      - key: PORT
+        value: 8788
+      - key: ROUNDTABLE_DB
+        value: /tmp/roundtable.sqlite
+    healthCheckPath: /api/health
+  - type: web
+    name: roundtable-ui
+    runtime: docker
+    dockerfilePath: apps/meeting-room/Dockerfile
+    dockerContext: .
+    plan: free
+    envVars:
+      - key: PORT
+        value: 3101
+      - key: NEXT_PUBLIC_ROUNDTABLE_API
+        fromService:
+          type: web
+          name: roundtable-api
+          envVarKey: RENDER_EXTERNAL_URL

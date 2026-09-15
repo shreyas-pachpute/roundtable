@@ -2,7 +2,18 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-const API = process.env.NEXT_PUBLIC_ROUNDTABLE_API ?? "http://127.0.0.1:8788";
+// The API address: ?api=https://... in the URL (remembered), else the build-time env, else local dev.
+const API = (() => {
+  const fallback = process.env.NEXT_PUBLIC_ROUNDTABLE_API ?? "http://127.0.0.1:8788";
+  if (typeof window === "undefined") return fallback;
+  try {
+    const q = new URLSearchParams(window.location.search).get("api");
+    if (q) localStorage.setItem("api", q);
+    return q ?? localStorage.getItem("api") ?? fallback;
+  } catch {
+    return fallback;
+  }
+})();
 
 type Msg = { id: number; meeting_id: string; round: string; kind: string; from_agent: string; to_agent: string; refs: string[]; text: string; ts: number };
 type Entry = { id: string; kind: string; owner: string; version: number; status: string; payload: any; evidence: any[] };
