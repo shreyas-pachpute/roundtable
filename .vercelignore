@@ -1,4 +1,4 @@
-apps/meeting-room
 docs
 data/runtime
 .env*
+.vercel
