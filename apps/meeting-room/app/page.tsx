@@ -15,110 +15,178 @@ const API = (() => {
   }
 })();
 
+type ModelSettings = { provider: string; model: string; base_url: string; api_key: string };
+const DEFAULT_SETTINGS: ModelSettings = { provider: "mock", model: "auto", base_url: "https://api.openai.com/v1", api_key: "" };
+let modelSettings: ModelSettings = DEFAULT_SETTINGS;
+function loadSettings(): ModelSettings {
+  try {
+    const raw = localStorage.getItem("model-settings");
+    if (raw) modelSettings = { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+  } catch {}
+  return modelSettings;
+}
+function saveSettings(s: ModelSettings) {
+  modelSettings = s;
+  try {
+    localStorage.setItem("model-settings", JSON.stringify(s));
+  } catch {}
+}
+
 type Msg = { id: number; meeting_id: string; round: string; kind: string; from_agent: string; to_agent: string; refs: string[]; text: string; ts: number };
 type Entry = { id: string; kind: string; owner: string; version: number; status: string; payload: any; evidence: any[] };
+type Decision = { id: string; kind: string; ref: string; text: string; options: string[] };
 type MeetingData = {
-  meeting: { id: string; title: string; status: string; round: string; waiting?: { kind: string; ref: string; text: string; options: string[] } | null };
+  meeting: { id: string; title: string; status: string; round: string; waiting?: Decision[] | null; model?: string };
   rounds: string[];
   blackboard: Record<string, Entry[]>;
-  messages: Msg[];
   turns: any[];
   cost: { tokens: number; usd: number; calls: number };
-  model: string;
+  db: string;
 };
-type Settings = { provider: string; model: string; base_url: string; has_key: boolean; key_hint: string; anthropic_models: string[] };
+type ServerSettings = { anthropic_models: string[]; server_default: string; label: string };
 
 const SEATS = ["chair", "researcher", "scoper", "estimator", "pricer", "risk", "writer", "critic", "arbiter", "you"];
-const ROUND_LABEL: Record<string, string> = { brief: "Brief", research: "Research", scope: "Scope", estimate: "Estimate", price: "Price + Risk", risk: "Risk", draft: "Draft", critique: "Critique", reconcile: "Reconcile", finalise: "Finalise" };
+const AGENDA = ["brief", "research", "scope", "estimate", "price", "draft", "critique", "reconcile", "human_seat", "finalise"];
+const ROUND_LABEL: Record<string, string> = { brief: "Brief", research: "Research", scope: "Scope", estimate: "Estimate", price: "Price + Risk", draft: "Draft", critique: "Critique", reconcile: "Reconcile", human_seat: "Your seat", finalise: "Finalise" };
 const TABS = ["requirements", "findings", "packages", "estimates", "pricing", "risks", "draft", "objections", "outputs"] as const;
 
 async function api(path: string, init?: RequestInit) {
-  const r = await fetch(API + path, { ...init, headers: { "content-type": "application/json", ...(init?.headers ?? {}) } });
+  const s = modelSettings;
+  const headers: Record<string, string> = { "content-type": "application/json", "x-model-provider": s.provider, "x-model-name": s.model, "x-model-base-url": s.base_url };
+  if (s.api_key) headers["x-model-key"] = s.api_key;
+  const r = await fetch(API + path, { ...init, headers: { ...headers, ...(init?.headers as Record<string, string> | undefined) } });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
+}
+
+function modelLabel(s: ModelSettings) {
+  if (s.provider === "anthropic") return `Anthropic · ${s.model === "auto" ? "Opus 5 + Sonnet 5" : s.model}`;
+  if (s.provider === "openai") {
+    try {
+      return `${s.model} @ ${new URL(s.base_url).host}`;
+    } catch {
+      return s.model;
+    }
+  }
+  return "Mock · no key";
 }
 
 export default function MeetingRoom() {
   const [mid, setMid] = useState<string | null>(null);
   const [data, setData] = useState<MeetingData | null>(null);
-  const [live, setLive] = useState<Msg[]>([]);
+  const [messages, setMessages] = useState<Msg[]>([]);
   const [tab, setTab] = useState<(typeof TABS)[number]>("requirements");
-  const [settings, setSettings] = useState<Settings | null>(null);
+  const [settings, setSettings] = useState<ModelSettings>(DEFAULT_SETTINGS);
+  const [server, setServer] = useState<ServerSettings | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [offline, setOffline] = useState(false);
-  const [note, setNote] = useState("");
+  const [stepping, setStepping] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const lastMsg = useRef(0);
+  const steppingRef = useRef(false);
   const transcriptRef = useRef<HTMLDivElement>(null);
 
-  const refresh = useCallback(async (id?: string | null) => {
-    const target = id ?? mid;
+  const refresh = useCallback(async (id: string) => {
     try {
-      if (!target) {
-        const l = await api("/api/meetings");
-        if (l.meetings?.length) setMid(l.meetings[0].id);
-        setOffline(false);
-        return;
-      }
-      const d = await api(`/api/meetings/${target}`);
+      const d = await api(`/api/meetings/${id}`);
       setData(d);
       setOffline(false);
+      return d as MeetingData;
     } catch {
       setOffline(true);
+      return null;
     }
-  }, [mid]);
+  }, []);
+
+  const pollMessages = useCallback(async (id: string) => {
+    try {
+      const r = await api(`/api/meetings/${id}/messages?after=${lastMsg.current}`);
+      if (r.messages?.length) {
+        lastMsg.current = r.last_id;
+        setMessages((prev) => [...prev, ...r.messages]);
+      }
+    } catch {}
+  }, []);
+
+  // the UI is the Chair's clock: one round per request until the meeting finishes or needs you
+  const drive = useCallback(async (id: string) => {
+    if (steppingRef.current) return;
+    steppingRef.current = true;
+    setStepping(true);
+    setError(null);
+    try {
+      for (let i = 0; i < 20; i++) {
+        const r = await api(`/api/meetings/${id}/step`, { method: "POST" });
+        await pollMessages(id);
+        await refresh(id);
+        if (r.finished || r.waiting) break;
+      }
+    } catch (e: any) {
+      setError(String(e.message ?? e));
+    } finally {
+      steppingRef.current = false;
+      setStepping(false);
+      refresh(id);
+    }
+  }, [pollMessages, refresh]);
 
   useEffect(() => {
-    refresh();
-    api("/api/settings").then(setSettings).catch(() => {});
-  }, [refresh]);
+    setSettings(loadSettings());
+    api("/api/settings").then(setServer).catch(() => {});
+    api("/api/meetings").then((l) => { if (l.meetings?.length) setMid(l.meetings[0].id); }).catch(() => setOffline(true));
+  }, []);
 
   useEffect(() => {
     if (!mid) return;
-    refresh(mid);
-    const es = new EventSource(`${API}/api/events?after=0`);
-    let t: ReturnType<typeof setTimeout> | null = null;
-    es.addEventListener("msg", (e) => {
-      const m = JSON.parse((e as MessageEvent).data) as Msg;
-      if (m.meeting_id !== mid) return;
-      setLive((prev) => (prev.some((p) => p.id === m.id) ? prev : [...prev, m]));
-      if (!t) t = setTimeout(() => { t = null; refresh(mid); }, 300);
-    });
-    es.onerror = () => setOffline(true);
-    const poll = setInterval(() => refresh(mid), 5000);
-    return () => { es.close(); clearInterval(poll); };
-  }, [mid, refresh]);
+    lastMsg.current = 0;
+    setMessages([]);
+    pollMessages(mid);
+    refresh(mid).then((d) => { if (d && d.meeting.status === "running") drive(mid); });
+    const t1 = setInterval(() => pollMessages(mid), 1000);
+    const t2 = setInterval(() => refresh(mid), 4000);
+    return () => { clearInterval(t1); clearInterval(t2); };
+  }, [mid, pollMessages, refresh, drive]);
 
   useEffect(() => {
     const el = transcriptRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [live.length]);
+  }, [messages.length]);
 
-  const messages = data?.messages?.length ? data.messages : live;
   const status = data?.meeting.status ?? "idle";
   const round = data?.meeting.round ?? "";
-  const waiting = data?.meeting.waiting ?? null;
+  const waiting = status === "waiting_for_human" ? (data?.meeting.waiting ?? []) : [];
   const activeAgents = useMemo(() => {
     const recent = messages.slice(-6);
     const s = new Set<string>();
-    for (const m of recent) { if (m.kind === "assign") s.add(m.to_agent); if (m.kind === "fanout") s.add(m.from_agent); }
-    if (waiting) s.add("you");
+    if (status === "running") for (const m of recent) { if (m.kind === "assign") s.add(m.to_agent); if (m.kind === "fanout") s.add(m.from_agent); }
+    if (waiting.length) s.add("you");
     return s;
-  }, [messages, waiting]);
+  }, [messages, waiting, status]);
   const bb = data?.blackboard ?? {};
   const current = (k: string) => (bb[k] ?? []).filter((e) => e.status !== "superseded");
 
-  const start = async () => { const r = await api("/api/meetings", { method: "POST" }); setLive([]); setMid(r.id); };
-  const reset = async () => { await api("/api/demo/reset", { method: "POST" }); setMid(null); setData(null); setLive([]); };
-  const [settleError, setSettleError] = useState<string | null>(null);
-  const settle = async (decision: string) => {
-    if (!mid) return;
+  const start = async () => {
+    setError(null);
     try {
-      await api(`/api/meetings/${mid}/human`, { method: "POST", body: JSON.stringify({ decision, note }) });
-      setNote("");
-      setSettleError(null);
+      const r = await api("/api/meetings", { method: "POST" });
+      setMid(r.id);
+      setTimeout(() => drive(r.id), 50);
     } catch (e: any) {
-      setSettleError(String(e.message ?? e));
+      setError(String(e.message ?? e));
     }
-    refresh(mid);
+  };
+  const reset = async () => { await api("/api/demo/reset", { method: "POST" }); setMid(null); setData(null); setMessages([]); lastMsg.current = 0; };
+  const settle = async (answers: Record<string, { decision: string; note: string }>) => {
+    if (!mid) return;
+    setError(null);
+    try {
+      await api(`/api/meetings/${mid}/human`, { method: "POST", body: JSON.stringify({ answers }) });
+      await pollMessages(mid);
+      await refresh(mid);
+      drive(mid);
+    } catch (e: any) {
+      setError(String(e.message ?? e));
+    }
   };
 
   return (
@@ -129,25 +197,25 @@ export default function MeetingRoom() {
           <span className="mono dim">meeting room · Harbor Logistics RFP</span>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <span className={`badge ${status === "running" ? "accent" : status === "waiting_for_human" ? "warn" : status === "finished" ? "ok" : ""}`}>
-            <span className={`dot ${status === "running" ? "pulse" : ""}`} /> {status === "waiting_for_human" ? "waiting for you" : offline ? "api offline" : status}
+          <span className={`badge ${stepping || status === "running" ? "accent" : status === "waiting_for_human" ? "warn" : status === "finished" ? "ok" : ""}`}>
+            <span className={`dot ${stepping ? "pulse" : ""}`} /> {status === "waiting_for_human" ? "waiting for you" : offline ? "api offline" : stepping ? "in session" : status}
           </span>
-          <button className="btn sm" onClick={() => setShowSettings((s) => !s)}>{settings ? modelLabel(settings) : "model"}</button>
-          <button className="btn sm" onClick={reset} disabled={status === "running"}>Reset</button>
-          <button className="btn primary sm" onClick={start} disabled={status === "running" || status === "waiting_for_human"}>Open the meeting →</button>
+          <button className="btn sm" onClick={() => setShowSettings((s) => !s)} title={data?.db}>{modelLabel(settings)}</button>
+          <button className="btn sm" onClick={reset} disabled={stepping}>Reset</button>
+          <button className="btn primary sm" onClick={start} disabled={stepping || status === "running" || status === "waiting_for_human"}>Open the meeting →</button>
         </div>
       </header>
 
-      {showSettings && settings ? <SettingsPanel settings={settings} onChange={setSettings} onClose={() => setShowSettings(false)} /> : null}
+      {showSettings ? <SettingsPanel settings={settings} server={server} onChange={(s) => { setSettings(s); saveSettings(s); }} onClose={() => setShowSettings(false)} judgmentNote="auto · Opus 5 for the Chair, Critic and Arbiter; Sonnet 5 for the rest" /> : null}
 
       <main className="grid" style={{ gridTemplateColumns: "300px minmax(0, 1fr) 420px" }}>
         <section className="col">
           <div className="card">
             <h2>Agenda</h2>
             <ol className="agenda">
-              {["brief", "research", "scope", "estimate", "price", "draft", "critique", "reconcile", "finalise"].map((r) => {
-                const idx = data?.rounds.indexOf(r) ?? -1;
-                const cur = data?.rounds.indexOf(round === "risk" ? "price" : round) ?? -1;
+              {AGENDA.map((r) => {
+                const idx = AGENDA.indexOf(r);
+                const cur = AGENDA.indexOf(round);
                 const state = status === "finished" ? "done" : idx < cur ? "done" : idx === cur && status !== "idle" ? "now" : "todo";
                 return <li key={r} data-state={state}><span className="dot" />{ROUND_LABEL[r]}</li>;
               })}
@@ -173,21 +241,13 @@ export default function MeetingRoom() {
                 <div className="stat"><span className="v">{(current("score").find((e) => e.payload.criterion === "weighted")?.payload.score ?? "–")}</span><span className="l">critic score /100</span></div>
               </div>
             ) : <div className="note">Press “Open the meeting” to start on the Harbor Logistics RFP.</div>}
+            {data?.meeting.model ? <div className="note" style={{ marginTop: 8 }}>Model: {data.meeting.model} · Store: {data.db}</div> : null}
           </div>
         </section>
 
         <section className="col">
-          {waiting ? (
-            <div className="card you">
-              <h2>Your seat · {waiting.kind === "risk" ? "a clause to settle" : "an objection to settle"}</h2>
-              <p style={{ margin: "0 0 10px", fontSize: 14 }}>{waiting.text}</p>
-              <input className="noteinput" value={note} onChange={(e) => setNote(e.target.value)} placeholder="Optional note for the minutes" />
-              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
-                {waiting.options.map((o, i) => <button key={o} className={`btn sm ${i === 0 ? "primary" : ""}`} onClick={() => settle(o)}>{o}</button>)}
-              </div>
-              {settleError ? <div className="note" style={{ color: "var(--bad)", marginTop: 6 }}>{settleError}</div> : null}
-            </div>
-          ) : null}
+          {error ? <div className="card" style={{ borderColor: "var(--bad)" }}><div className="note" style={{ color: "var(--bad)" }}>{error}</div></div> : null}
+          {waiting.length ? <Seat decisions={waiting} onSettle={settle} /> : null}
           <div className="card" style={{ flex: 1, minHeight: 400, display: "flex", flexDirection: "column" }}>
             <h2>Transcript · {messages.length} messages</h2>
             <div ref={transcriptRef} className="transcript">
@@ -220,6 +280,36 @@ export default function MeetingRoom() {
   );
 }
 
+function Seat({ decisions, onSettle }: { decisions: Decision[]; onSettle: (a: Record<string, { decision: string; note: string }>) => Promise<void> }) {
+  const [picked, setPicked] = useState<Record<string, string>>({});
+  const [notes, setNotes] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState(false);
+  const ready = decisions.every((d) => picked[d.id]);
+  return (
+    <div className="card you">
+      <h2>Your seat · {decisions.length} decision{decisions.length !== 1 ? "s" : ""}</h2>
+      <div style={{ display: "grid", gap: 12 }}>
+        {decisions.map((d) => (
+          <div key={d.id} className="row" style={{ background: "#fff" }}>
+            <div className="row-head"><span className="badge">{d.kind}</span><span className="mono dim">{d.ref}</span></div>
+            <p style={{ margin: "4px 0 8px", fontSize: 13.5 }}>{d.text}</p>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {d.options.map((o) => <button key={o} className={`btn sm ${picked[d.id] === o ? "primary" : ""}`} onClick={() => setPicked((p) => ({ ...p, [d.id]: o }))}>{o}</button>)}
+            </div>
+            <input className="noteinput" style={{ marginTop: 8 }} value={notes[d.id] ?? ""} onChange={(e) => setNotes((n) => ({ ...n, [d.id]: e.target.value }))} placeholder="Optional note for the minutes" />
+          </div>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 12 }}>
+        <button className="btn primary sm" disabled={!ready || busy} onClick={async () => { setBusy(true); try { await onSettle(Object.fromEntries(decisions.map((d) => [d.id, { decision: picked[d.id], note: notes[d.id] ?? "" }]))); } finally { setBusy(false); } }}>
+          Send decisions and resume the meeting
+        </button>
+        {!ready ? <span className="note">Pick an option for each item.</span> : null}
+      </div>
+    </div>
+  );
+}
+
 function countFor(tab: string, bb: Record<string, Entry[]>) {
   const cur = (k: string) => (bb[k] ?? []).filter((e) => e.status !== "superseded").length;
   return { requirements: cur("requirement"), findings: cur("finding"), packages: cur("work_package"), estimates: cur("estimate"), pricing: cur("price_line"), risks: cur("risk"), draft: cur("section"), objections: cur("objection"), outputs: cur("output") }[tab] ?? 0;
@@ -227,12 +317,6 @@ function countFor(tab: string, bb: Record<string, Entry[]>) {
 
 function kindClass(k: string) {
   return { objection: "bad", ruling: "blue", defence: "warn", revision: "ok", escalate: "warn", human: "ok", error: "bad", reject: "bad", warning: "warn", deliver: "ok", fanout: "accent", parallel: "accent", done: "ok" }[k] ?? "";
-}
-
-function modelLabel(s: Settings) {
-  if (s.provider === "anthropic") return `Anthropic · ${s.model === "auto" ? "Opus 5 + Sonnet 5" : s.model}`;
-  if (s.provider === "openai") return `${s.model} @ ${new URL(s.base_url).host}`;
-  return "Mock · no key";
 }
 
 function Blackboard({ tab, bb }: { tab: string; bb: Record<string, Entry[]> }) {
@@ -337,19 +421,20 @@ function Empty({ what }: { what: string }) {
   return <div className="empty">{what} will appear here.</div>;
 }
 
-function SettingsPanel({ settings, onChange, onClose }: { settings: Settings; onChange: (s: Settings) => void; onClose: () => void }) {
+function SettingsPanel({ settings, server, onChange, onClose, judgmentNote }: { settings: ModelSettings; server: ServerSettings | null; onChange: (s: ModelSettings) => void; onClose: () => void; judgmentNote?: string }) {
   const [provider, setProvider] = useState(settings.provider);
   const [model, setModel] = useState(settings.model);
   const [baseUrl, setBaseUrl] = useState(settings.base_url);
-  const [key, setKey] = useState("");
+  const [key, setKey] = useState(settings.api_key);
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const models = server?.anthropic_models ?? ["auto", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
   const save = async () => {
     setBusy(true);
+    const next: ModelSettings = { provider, model: provider === "anthropic" && !models.includes(model) ? "auto" : model, base_url: baseUrl, api_key: provider === "mock" ? "" : key };
+    onChange(next);
     try {
-      const s = await api("/api/settings", { method: "POST", body: JSON.stringify({ provider, model: provider === "anthropic" && !settings.anthropic_models.includes(model) ? "auto" : model, base_url: baseUrl, api_key: key || undefined }) });
-      onChange(s);
-      setStatus("Saved. Checking…");
+      setStatus("Saved in this browser. Checking…");
       const c = await api("/api/settings/check", { method: "POST" });
       setStatus((c.ok ? "✓ " : "✗ ") + c.detail);
     } catch (e: any) {
@@ -373,7 +458,7 @@ function SettingsPanel({ settings, onChange, onClose }: { settings: Settings; on
         </select>
       </div>
       {provider === "anthropic" ? (
-        <div className="field"><label>Model</label><select value={model} onChange={(e) => setModel(e.target.value)}>{settings.anthropic_models.map((m) => <option key={m} value={m}>{m === "auto" ? "auto · Opus 5 for the Chair, Critic and Arbiter; Sonnet 5 for the rest" : m}</option>)}</select></div>
+        <div className="field"><label>Model</label><select value={model} onChange={(e) => setModel(e.target.value)}>{models.map((m) => <option key={m} value={m}>{m === "auto" ? (judgmentNote ?? "auto") : m}</option>)}</select></div>
       ) : null}
       {provider === "openai" ? (
         <>
@@ -382,11 +467,11 @@ function SettingsPanel({ settings, onChange, onClose }: { settings: Settings; on
         </>
       ) : null}
       {provider !== "mock" ? (
-        <div className="field"><label>API key {settings.has_key ? `(current: ${settings.key_hint})` : ""}</label><input type="password" value={key} onChange={(e) => setKey(e.target.value)} placeholder={settings.has_key ? "leave blank to keep the current key" : "paste your key"} /></div>
+        <div className="field"><label>API key</label><input type="password" value={key} onChange={(e) => setKey(e.target.value)} placeholder="paste your key" autoComplete="off" /></div>
       ) : null}
       <div style={{ gridColumn: "1 / -1", display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
         <button className="btn primary sm" onClick={save} disabled={busy}>Save and test</button>
-        <span className="note">{status ?? "The key stays in the local server's memory for this session. It is never written to disk or sent anywhere but the provider you chose."}</span>
+        <span className="note">{status ?? "Your key stays in this browser and is sent only with your own requests, straight to the provider you chose. The server never stores it."}</span>
       </div>
     </div>
   );

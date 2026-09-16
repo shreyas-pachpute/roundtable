@@ -1,25 +1,34 @@
-"""The Chair: rounds in order, turns with budgets, fan-out estimation, objections with evidence, arbitration, a human seat.
-Implemented as a LangGraph state machine so every transition is an explicit edge."""
+"""The Chair as a LangGraph state machine with a checkpointer.
+
+Each round is a node. The graph pauses after every node (so a serverless request runs exactly one round),
+persists its state in Postgres, and pauses on `interrupt()` when the human seat is needed. The meeting
+resumes with the next request, on any server instance. Model settings travel in a context variable set
+per request; they are never written to the checkpoint.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import json
+import contextvars
 import re
 import uuid
 from typing import Any, TypedDict
 
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
 
 from . import schemas as S
-from .gateway import Gateway
+from .gateway import Gateway, Settings
 from .prompts import ROLES, render
 from .store import Store
 
-ROUNDS = ["brief", "research", "scope", "estimate", "price", "risk", "draft", "critique", "reconcile", "finalise"]
+ROUNDS = ["brief", "research", "scope", "estimate", "price", "draft", "critique", "reconcile", "human_seat", "finalise"]
 SECTIONS = ["Understanding and approach", "Response to requirements", "Team and experience", "Delivery plan and timeline", "Commercials", "Risks and assumptions"]
 OWNER_OF = {"section": "writer", "pricing": "pricer", "estimate": "estimator", "risk": "risk"}
-LIMITS = {"objections_per_meeting": 5, "defence_rounds": 2, "arbitrations": 3, "reentries": 2}
+LIMITS = {"objections_per_meeting": 5, "arbitrations": 3}
+
+current_settings: contextvars.ContextVar[Settings] = contextvars.ContextVar("current_settings")
 
 
 def _norm(s: str) -> str:
@@ -28,12 +37,11 @@ def _norm(s: str) -> str:
 
 class MeetingState(TypedDict, total=False):
     meeting_id: str
-    reopen: str | None
-    reentries: int
+    answers: dict[str, dict[str, str]]
 
 
 class Meeting:
-    """One meeting's runtime: the store, the gateway, the RFP, the knowledge base and the human's inbox."""
+    """One meeting's runtime for one request: the store, the gateway, the RFP and the knowledge base."""
 
     def __init__(self, mid: str, store: Store, gw: Gateway, rfp: dict[str, Any], kb: list[dict[str, Any]]):
         self.id = mid
@@ -42,12 +50,7 @@ class Meeting:
         self.rfp = rfp
         self.kb = kb
         self.kb_by_id = {c["id"]: c for c in kb}
-        self.round = "brief"
-        self.human_event = asyncio.Event()
-        self.pending: dict[str, Any] | None = None
-        self.human_answer: dict[str, Any] | None = None
-        self.arbitrations = 0
-        self.objections_raised = 0
+        self.round = (store.meeting(mid) or {}).get("round") or "brief"
 
     # ------------------------------------------------------------ bus helpers
     def say(self, kind: str, frm: str, to: str, text: str, refs: list[str] | None = None) -> None:
@@ -56,10 +59,11 @@ class Meeting:
     async def turn(self, agent: str, task: str, schema: type[S.BaseModel], evidence: dict[str, Any], role: str | None = None, ctx: dict[str, Any] | None = None):
         tid = f"turn-{uuid.uuid4().hex[:8]}"
         self.store.start_turn(tid, self.id, self.round, agent)
-        self.gw.current = {"meeting": self.id, "turn": tid}
+        gw = Gateway(self.store, self.gw.settings)  # per-turn gateway so parallel turns record against their own turn id
+        gw.current = {"meeting": self.id, "turn": tid}
         self.say("assign", "chair", agent, task)
         try:
-            out = await self.gw.complete(role=role or agent, schema=schema, system=ROLES[role or agent], user=render(evidence, task), case_id=self.id, context=ctx or {})
+            out = await gw.complete(role=role or agent, schema=schema, system=ROLES[role or agent], user=render(evidence, task), case_id=self.id, context=ctx or {})
             self.store.end_turn(tid, "done")
             return out
         except Exception as e:  # noqa: BLE001
@@ -76,7 +80,7 @@ class Meeting:
     def set_round(self, r: str) -> None:
         self.round = r
         self.store.set_meeting(self.id, round=r)
-        self.say("round", "chair", "all", f"Round: {r}")
+        self.say("round", "chair", "all", f"Round: {r.replace('_', ' ')}")
 
     def rfp_text(self) -> str:
         return "\n\n".join(f"[page {p['page']}]\n{p['text']}" for p in self.rfp["pages"])
@@ -94,23 +98,10 @@ class Meeting:
         ids |= {i["id"] for i in self.kb_by_id.get("playbook", {}).get("data", [])}
         return {i for i in ids if i}
 
-    # ------------------------------------------------------------ human seat
-    async def ask_human(self, kind: str, ref: str, text: str, options: list[str]) -> dict[str, Any]:
-        self.pending = {"kind": kind, "ref": ref, "text": text, "options": options}
-        self.store.set_meeting(self.id, status="waiting_for_human", waiting=self.pending)
-        self.say("escalate", "chair", "you", text, [ref])
-        self.human_event.clear()
-        await self.human_event.wait()
-        answer = self.human_answer or {"decision": options[0], "note": ""}
-        self.pending = None
-        self.human_answer = None
-        self.store.set_meeting(self.id, status="running", waiting=None)
-        self.say("human", "you", "chair", f"{answer.get('decision')}" + (f": {answer.get('note')}" if answer.get("note") else ""), [ref])
-        return answer
-
-    def resolve_human(self, decision: str, note: str = "") -> None:
-        self.human_answer = {"decision": decision, "note": note}
-        self.human_event.set()
+    def ask_later(self, kind: str, ref: str, text: str, options: list[str]) -> None:
+        """Queue a decision for the human seat; the human_seat node raises them all at once."""
+        n = len(self.entries("decision")) + 1
+        self.put(f"decision:{n}", "decision", "chair", {"kind": kind, "ref": ref, "text": text, "options": options}, [{"type": "entry", "ref": ref}], status="open")
 
 
 # ------------------------------------------------------------------ rounds
@@ -133,12 +124,12 @@ async def r_research(m: Meeting) -> None:
     out = await m.turn("researcher", "Produce findings the team should know, each with its source id.", S.Findings, {"knowledge_base": kb, "rfp_summary": m.rfp_text()[:3000], "criteria": m.rfp["evaluation_criteria"]}, ctx={})
     ok = m.known_ids()
     kept = 0
-    for i, f in enumerate(out.findings, 1):
+    for f in out.findings:
         if f.source_id not in ok:
             m.say("reject", "chair", "researcher", f"Finding dropped: source '{f.source_id}' is not in the evidence")
             continue
-        m.put(f"finding:{i}", "finding", "researcher", f.model_dump(), [{"type": "source", "ref": f.source_id}])
         kept += 1
+        m.put(f"finding:{kept}", "finding", "researcher", f.model_dump(), [{"type": "source", "ref": f.source_id}])
     m.say("deliver", "researcher", "chair", f"{kept} findings, every one with a source", [f"finding:{i}" for i in range(1, kept + 1)])
 
 
@@ -189,8 +180,9 @@ async def r_estimate(m: Meeting) -> None:
         days = [sum(rd.days for rd in e.days_by_role) for e in ests]
         chosen = ests[0]
         if len(ests) == 2 and max(days) > 0 and abs(days[0] - days[1]) / max(days) > 0.25:
-            flags.append({"package_id": wp["id"], "note": f"Two estimates disagree by {abs(days[0]-days[1])/max(days):.0%} ({days[0]:g} vs {days[1]:g} days): {ests[1].assumptions[-1] if ests[1].assumptions else 'different assumptions'}. Using the lower estimate and raising a client question."})
-            m.put(f"q:{len(m.entries('question'))+1}", "question", "estimator", {"text": f"Please confirm the assumption behind {wp['id']} ({wp['name']}): {ests[1].assumptions[-1] if ests[1].assumptions else 'scope reading'}.", "why": f"Two independent estimates disagree by more than 25%."}, [], status="open")
+            note = ests[1].assumptions[-1] if ests[1].assumptions else "different assumptions"
+            flags.append({"package_id": wp["id"], "note": f"Two estimates disagree by {abs(days[0]-days[1])/max(days):.0%} ({days[0]:g} vs {days[1]:g} days): {note}. Using the lower estimate and raising a client question."})
+            m.put(f"q:{len(m.entries('question'))+1}", "question", "estimator", {"text": f"Please confirm the assumption behind {wp['id']} ({wp['name']}): {note}.", "why": "Two independent estimates disagree by more than 25%."}, [], status="open")
         payload = chosen.model_dump()
         payload["alternatives"] = [e.model_dump() for e in ests[1:]]
         m.put(f"est:{wp['id']}", "estimate", "estimator", payload, [{"type": "source", "ref": "past-packages"}, {"type": "entry", "ref": f"wp:{wp['id']}"}])
@@ -247,12 +239,12 @@ async def r_risk(m: Meeting) -> None:
     playbook = m.kb_by_id["playbook"]["data"]
     out = await m.turn("risk", "Build the risk register from the contract terms and constraints against the playbook, plus delivery risks.", S.RiskRegister, {"rfp": m.rfp, "playbook": m.kb_by_id["playbook"], "packages": [e["payload"] for e in m.entries("work_package")]}, ctx={"rfp": m.rfp, "playbook": playbook})
     kept = 0
-    for i, r in enumerate(out.risks, 1):
+    for r in out.risks:
         if not m.quote_ok(r.quote, r.page):
             m.say("reject", "chair", "risk", f"Risk dropped: quote not found verbatim on page {r.page}")
             continue
-        m.put(f"risk:{i}", "risk", "risk", r.model_dump(), [{"type": "rfp_page", "ref": r.page, "quote": r.quote}, *([{"type": "source", "ref": r.playbook_id}] if r.playbook_id else [])])
         kept += 1
+        m.put(f"risk:{kept}", "risk", "risk", r.model_dump(), [{"type": "rfp_page", "ref": r.page, "quote": r.quote}, *([{"type": "source", "ref": r.playbook_id}] if r.playbook_id else [])])
     declines = [e for e in m.entries("risk") if e["payload"]["stance"] == "decline"]
     m.say("deliver", "risk", "chair", f"{kept} risks; {len(declines)} must-negotiate clause{'s' if len(declines)!=1 else ''} flagged for you", [e["id"] for e in m.entries("risk")])
 
@@ -297,18 +289,19 @@ async def r_critique(m: Meeting) -> None:
     ok = m.known_ids()
     raised = 0
     for i, o in enumerate(out.objections, 1):
-        if m.objections_raised >= LIMITS["objections_per_meeting"]:
+        if int((m.store.meeting(m.id) or {}).get("objections_raised") or 0) >= LIMITS["objections_per_meeting"]:
             m.say("limit", "chair", "critic", "Objection limit for this meeting reached")
             break
         missing = [e for e in o.evidence_ids if e not in ok]
         if missing or not o.evidence_ids:
-            m.say("reject", "chair", "critic", f"Objection on {o.target_id} rejected before it costs a turn: evidence {missing or 'missing'} is not in the blackboard")
+            m.say("reject", "chair", "critic", f"Objection on {o.target_id} rejected before it costs a turn: evidence {missing or 'missing'} is not on the blackboard")
             continue
         m.put(f"obj:{i}", "objection", "critic", o.model_dump(), [{"type": "entry", "ref": e} for e in o.evidence_ids], status="open")
-        m.objections_raised += 1
+        m.store.bump(m.id, "objections_raised")
         raised += 1
         m.say("objection", "critic", OWNER_OF[o.target_kind], f"On {o.target_id}: {o.claim}", [f"obj:{i}", o.target_id])
-    weighted = sum(sc.score * next(c["weight"] for c in m.rfp["evaluation_criteria"] if c["id"] == sc.criterion) for sc in out.scores if any(c["id"] == sc.criterion for c in m.rfp["evaluation_criteria"])) / 10
+    weights = {c["id"]: c["weight"] for c in m.rfp["evaluation_criteria"]}
+    weighted = sum(sc.score * weights.get(sc.criterion, 0) for sc in out.scores) / 10
     m.put("score:weighted", "score", "critic", {"criterion": "weighted", "score": round(weighted), "reason": out.summary})
     m.say("deliver", "critic", "chair", f"Weighted score {weighted:.0f}/100; {raised} objection{'s' if raised!=1 else ''} raised, {len(out.unsupported_claims)} unsupported claims", ["score:weighted"])
 
@@ -322,50 +315,89 @@ async def r_reconcile(m: Meeting) -> None:
         if not target:
             m.store.set_status(m.id, obj["id"], "dropped")
             continue
-        settled = False
-        for _ in range(LIMITS["defence_rounds"]):
-            d = await m.turn(owner, f"Respond to the objection on {o['target_id']}: accept and revise, or defend with evidence.", S.Defence, {"objection": o, "target": target, "evidence": {k: m.kb_by_id[k] for k in o["evidence_ids"] if k in m.kb_by_id}, "context": [e["payload"] for e in m.entries("finding")]}, role="defence", ctx={"objection": o, "target": target})
-            if d.accept:
-                payload = dict(target["payload"])
-                if o["target_kind"] == "section" and d.revised_text:
-                    payload["body"] = d.revised_text
-                elif d.revised_text:
-                    payload["note"] = d.revised_text
-                m.store.put(m.id, o["target_id"], target["kind"], target["owner"], payload, target["evidence"])
-                m.store.set_status(m.id, obj["id"], "accepted")
-                m.say("revision", owner, "critic", f"Accepted; {o['target_id']} revised (v{target['version']+1}). {d.response}", [o["target_id"], obj["id"]])
-                settled = True
-                break
-            m.say("defence", owner, "critic", d.response, d.evidence_ids)
-            break  # one defence, then the Arbiter; the Critic does not get a second bite in v0
-        if settled:
-            continue
-        if m.arbitrations >= LIMITS["arbitrations"]:
-            ans = await m.ask_human("objection", obj["id"], f"Arbitration limit reached. Settle the objection on {o['target_id']}: {o['claim']}", ["uphold objection", "overrule objection"])
-            decision = "uphold_objection" if ans["decision"].startswith("uphold") else "overrule_objection"
-        else:
-            m.arbitrations += 1
-            r = await m.turn("arbiter", f"Rule on the objection to {o['target_id']}.", S.Ruling, {"objection": o, "target": target, "defence_messages": [x for x in m.store.messages(m.id) if x["kind"] == "defence"][-1:], "margin_policy": m.kb_by_id.get("margin-policy"), "past_proposals": [c for c in m.kb if c["kind"] == "past_proposal"]}, ctx={"objection": o})
-            m.say("ruling", "arbiter", "all", f"{r.decision.replace('_', ' ')}: {r.reason}", [obj["id"]])
-            decision = r.decision
-            if decision == "escalate":
-                ans = await m.ask_human("objection", obj["id"], f"The Arbiter escalated the objection on {o['target_id']}: {o['claim']}", ["uphold objection", "overrule objection"])
-                decision = "uphold_objection" if ans["decision"].startswith("uphold") else "overrule_objection"
-        if decision == "uphold_objection":
-            d = await m.turn(owner, f"The objection on {o['target_id']} was upheld. Revise accordingly.", S.Defence, {"objection": o, "target": target, "instruction": "accept and revise"}, role="defence", ctx={"objection": o, "target": target, "force_accept": True})
+        d = await m.turn(owner, f"Respond to the objection on {o['target_id']}: accept and revise, or defend with evidence.", S.Defence, {"objection": o, "target": target, "evidence": {k: m.kb_by_id[k] for k in o["evidence_ids"] if k in m.kb_by_id}, "context": [e["payload"] for e in m.entries("finding")]}, role="defence", ctx={"objection": o, "target": target})
+        if d.accept:
             payload = dict(target["payload"])
-            if d.revised_text:
-                payload["body" if o["target_kind"] == "section" else "note"] = d.revised_text
+            if o["target_kind"] == "section" and d.revised_text:
+                payload["body"] = d.revised_text
+            elif d.revised_text:
+                payload["note"] = d.revised_text
             m.store.put(m.id, o["target_id"], target["kind"], target["owner"], payload, target["evidence"])
-            m.store.set_status(m.id, obj["id"], "upheld")
+            m.store.set_status(m.id, obj["id"], "accepted")
+            m.say("revision", owner, "critic", f"Accepted; {o['target_id']} revised (v{target['version']+1}). {d.response}", [o["target_id"], obj["id"]])
+            continue
+        m.say("defence", owner, "critic", d.response, d.evidence_ids)
+        if int((m.store.meeting(m.id) or {}).get("arbitrations") or 0) >= LIMITS["arbitrations"]:
+            m.ask_later("objection", obj["id"], f"Arbitration limit reached. Settle the objection on {o['target_id']}: {o['claim']}", ["uphold objection", "overrule objection"])
+            continue
+        m.store.bump(m.id, "arbitrations")
+        r = await m.turn("arbiter", f"Rule on the objection to {o['target_id']}.", S.Ruling, {"objection": o, "target": target, "defence": d.model_dump(), "margin_policy": m.kb_by_id.get("margin-policy"), "past_proposals": [c for c in m.kb if c["kind"] == "past_proposal"]}, ctx={"objection": o})
+        m.say("ruling", "arbiter", "all", f"{r.decision.replace('_', ' ')}: {r.reason}", [obj["id"]])
+        if r.decision == "escalate":
+            m.ask_later("objection", obj["id"], f"The Arbiter escalated the objection on {o['target_id']}: {o['claim']}", ["uphold objection", "overrule objection"])
+        elif r.decision == "uphold_objection":
+            await _revise_after_uphold(m, obj, target)
         else:
             m.store.set_status(m.id, obj["id"], "overruled")
-
     # must-negotiate clauses always go to the human seat before finalising
     for risk in [e for e in m.entries("risk") if e["payload"]["stance"] == "decline" and e["status"] == "open"]:
         p = risk["payload"]
-        ans = await m.ask_human("risk", risk["id"], f"Clause to decline per playbook {p.get('playbook_id')}: “{p['quote']}”. Propose our position: {p['position']}?", ["propose our position", "accept the client's clause", "leave open for negotiation"])
-        m.store.put(m.id, risk["id"], "risk", "human", {**p, "decision": ans["decision"], "note": ans.get("note", "")}, risk["evidence"], status="settled")
+        m.ask_later("risk", risk["id"], f"Clause to decline per playbook {p.get('playbook_id')}: “{p['quote']}”. Propose our position: {p['position']}?", ["propose our position", "accept the client's clause", "leave open for negotiation"])
+    pending = [e for e in m.entries("decision") if e["status"] == "open"]
+    m.say("deliver", "chair", "you" if pending else "all", f"{len(pending)} decision{'s' if len(pending)!=1 else ''} for your seat" if pending else "Nothing needs your seat; finalising", [e["id"] for e in pending])
+
+
+async def _revise_after_uphold(m: Meeting, obj: dict[str, Any], target: dict[str, Any]) -> None:
+    o = obj["payload"]
+    owner = OWNER_OF[o["target_kind"]]
+    d = await m.turn(owner, f"The objection on {o['target_id']} was upheld. Revise accordingly.", S.Defence, {"objection": o, "target": target, "instruction": "accept and revise"}, role="defence", ctx={"objection": o, "target": target, "force_accept": True})
+    payload = dict(target["payload"])
+    if d.revised_text:
+        payload["body" if o["target_kind"] == "section" else "note"] = d.revised_text
+    m.store.put(m.id, o["target_id"], target["kind"], target["owner"], payload, target["evidence"])
+    m.store.set_status(m.id, obj["id"], "upheld")
+
+
+def human_seat(m: Meeting) -> dict[str, dict[str, str]]:
+    """Raise every open decision at once. On resume, `interrupt` returns the answers and the node completes."""
+    # a resumed node replays from its start, so only announce the seat the first time through
+    already = (m.store.meeting(m.id) or {}).get("status") == "waiting_for_human"
+    if not already:
+        m.set_round("human_seat")
+    else:
+        m.round = "human_seat"
+    pending = [e for e in m.entries("decision") if e["status"] == "open"]
+    if not pending:
+        return {}
+    payload = [{"id": e["id"], **e["payload"]} for e in pending]
+    if not already:
+        m.store.set_meeting(m.id, status="waiting_for_human", waiting=payload)
+        m.say("escalate", "chair", "you", f"Waiting for your seat: {len(payload)} decision{'s' if len(payload)!=1 else ''}", [e["id"] for e in pending])
+    answers = interrupt(payload)
+    m.store.set_meeting(m.id, status="running", waiting=None)
+    return answers or {}
+
+
+async def apply_human(m: Meeting, answers: dict[str, dict[str, str]]) -> None:
+    for e in [e for e in m.entries("decision") if e["status"] == "open"]:
+        a = answers.get(e["id"]) or {}
+        decision = a.get("decision") or e["payload"]["options"][0]
+        note = a.get("note") or ""
+        m.say("human", "you", "chair", decision + (f": {note}" if note else ""), [e["payload"]["ref"]])
+        ref = e["payload"]["ref"]
+        if e["payload"]["kind"] == "risk":
+            risk = m.store.get(m.id, ref)
+            if risk:
+                m.store.put(m.id, ref, "risk", "human", {**risk["payload"], "decision": decision, "note": note}, risk["evidence"], status="settled")
+        else:
+            obj = m.store.get(m.id, ref)
+            if obj:
+                target = m.store.get(m.id, obj["payload"]["target_id"])
+                if decision.startswith("uphold") and target:
+                    await _revise_after_uphold(m, obj, target)
+                else:
+                    m.store.set_status(m.id, ref, "overruled")
+        m.store.set_status(m.id, e["id"], "settled")
 
 
 async def r_finalise(m: Meeting) -> None:
@@ -379,35 +411,92 @@ async def r_finalise(m: Meeting) -> None:
     m.say("done", "chair", "all", "Proposal, pricing sheet, risk register, client Q&A and minutes are ready", [f"out:{k}" for k in outputs])
 
 
-def build_graph(m: Meeting):
-    async def node(fn):
-        async def _n(s: MeetingState) -> MeetingState:
-            await fn(m)
+# ------------------------------------------------------------------ the graph
+
+class Engine:
+    """Compiles the meeting graph once per process with a checkpointer; runs one round per `step`."""
+
+    def __init__(self, store: Store, rfp: dict[str, Any], kb: list[dict[str, Any]]):
+        self.store = store
+        self.rfp = rfp
+        self.kb = kb
+        self.saver = self._make_saver()
+        self.graph = self._build()
+
+    def _make_saver(self):
+        if self.store.db.pg:
+            from langgraph.checkpoint.postgres import PostgresSaver
+
+            saver = PostgresSaver(self.store.db.pool)  # type: ignore[arg-type]
+            saver.setup()
+            return saver
+        return MemorySaver()
+
+    def meeting(self, mid: str) -> Meeting:
+        settings = current_settings.get(None) or Settings.from_env()
+        return Meeting(mid, self.store, Gateway(self.store, settings), self.rfp, self.kb)
+
+    def _build(self):
+        async def wrap(fn):
+            return fn
+
+        steps = [("brief", r_brief), ("research", r_research), ("scope", r_scope), ("estimate", r_estimate), ("price", r_price_and_risk), ("draft", r_draft), ("critique", r_critique), ("reconcile", r_reconcile)]
+        g = StateGraph(MeetingState)
+
+        def make(fn):
+            async def node(s: MeetingState) -> MeetingState:
+                await fn(self.meeting(s["meeting_id"]))
+                return {}
+
+            return node
+
+        for name, fn in steps:
+            g.add_node(name, make(fn))
+
+        def n_human(s: MeetingState) -> MeetingState:
+            return {"answers": human_seat(self.meeting(s["meeting_id"]))}
+
+        async def n_apply(s: MeetingState) -> MeetingState:
+            await apply_human(self.meeting(s["meeting_id"]), s.get("answers") or {})
             return {}
-        return _n
 
-    g = StateGraph(MeetingState)
-    steps = [("brief", r_brief), ("research", r_research), ("scope", r_scope), ("estimate", r_estimate), ("price_risk", r_price_and_risk), ("draft", r_draft), ("critique", r_critique), ("reconcile", r_reconcile), ("finalise", r_finalise)]
-
-    def wrap(fn):
-        async def _n(s: MeetingState) -> MeetingState:
-            await fn(m)
+        async def n_final(s: MeetingState) -> MeetingState:
+            await r_finalise(self.meeting(s["meeting_id"]))
             return {}
-        return _n
 
-    for name, fn in steps:
-        g.add_node(name, wrap(fn))
-    g.add_edge(START, "brief")
-    for (a, _), (b, _) in zip(steps, steps[1:]):
-        g.add_edge(a, b)
-    g.add_edge("finalise", END)
-    return g.compile()
+        g.add_node("human_seat", n_human)
+        g.add_node("apply_human", n_apply)
+        g.add_node("finalise", n_final)
+        order = [n for n, _ in steps] + ["human_seat", "apply_human", "finalise"]
+        g.add_edge(START, order[0])
+        for a, b in zip(order, order[1:]):
+            g.add_edge(a, b)
+        g.add_edge("finalise", END)
+        # pause after every round so one HTTP request runs one round
+        return g.compile(checkpointer=self.saver, interrupt_after=order[:-1])
 
+    def config(self, mid: str) -> dict[str, Any]:
+        return {"configurable": {"thread_id": mid}}
 
-async def run_meeting(m: Meeting) -> None:
-    graph = build_graph(m)
-    try:
-        await graph.ainvoke({"meeting_id": m.id, "reopen": None, "reentries": 0})
-    except Exception as e:  # noqa: BLE001
-        m.say("error", "chair", "all", f"Meeting failed: {type(e).__name__}: {str(e)[:300]}")
-        m.store.set_meeting(m.id, status="failed")
+    async def step(self, mid: str, settings: Settings, resume: dict[str, Any] | None = None, first: bool = False) -> dict[str, Any]:
+        token = current_settings.set(settings)
+        try:
+            cfg = self.config(mid)
+            if first:
+                await self.graph.ainvoke({"meeting_id": mid}, cfg)
+            elif resume is not None:
+                await self.graph.ainvoke(Command(resume=resume), cfg)
+            else:
+                await self.graph.ainvoke(None, cfg)
+        except Exception as e:  # noqa: BLE001
+            self.store.say(mid, "chair", "error", "chair", "all", f"Round failed: {type(e).__name__}: {str(e)[:300]}")
+            self.store.set_meeting(mid, status="failed")
+            raise
+        finally:
+            current_settings.reset(token)
+        st = await self.graph.aget_state(cfg)
+        waiting = bool(getattr(st, "interrupts", None)) or (self.store.meeting(mid) or {}).get("status") == "waiting_for_human"
+        finished = not st.next
+        if finished:
+            self.store.set_meeting(mid, status="finished")
+        return {"next": list(st.next), "waiting": waiting, "finished": finished}

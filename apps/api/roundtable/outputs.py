@@ -56,7 +56,7 @@ def assemble(m: "Meeting") -> dict[str, str]:
 
     # ---- minutes: the transcript
     msgs = m.store.messages(m.id)
-    turns = m.turns_summary() if hasattr(m, "turns_summary") else None
+    turns = None
     mins = [f"# Minutes · {m.rfp['title']}", f"*{time.strftime('%Y-%m-%d %H:%M')}*", ""]
     current = None
     for x in msgs:
