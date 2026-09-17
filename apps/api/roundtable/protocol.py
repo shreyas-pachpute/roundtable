@@ -442,12 +442,18 @@ class Engine:
                 from psycopg.rows import dict_row
                 from psycopg_pool import AsyncConnectionPool
 
+                schema = self.store.db.schema
+
+                async def configure(conn: Any) -> None:
+                    await conn.execute(f"SET search_path TO {schema}, public")
+
                 self._pool = AsyncConnectionPool(
                     self.store.db.url,
                     min_size=0,
                     max_size=4,
                     open=False,
-                    kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row, "options": f"-c search_path={self.store.db.schema},public"},
+                    configure=configure,
+                    kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
                 )
                 await self._pool.open()
                 saver = AsyncPostgresSaver(self._pool)  # type: ignore[arg-type]
