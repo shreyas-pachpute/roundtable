@@ -420,17 +420,42 @@ class Engine:
         self.store = store
         self.rfp = rfp
         self.kb = kb
-        self.saver = self._make_saver()
-        self.graph = self._build()
+        self.saver: Any = None
+        self.graph: Any = None
+        self._pool: Any = None
+        self._lock = asyncio.Lock()
 
-    def _make_saver(self):
-        if self.store.db.pg:
-            from langgraph.checkpoint.postgres import PostgresSaver
+    @property
+    def saver_label(self) -> str:
+        return "AsyncPostgresSaver" if self.store.db.pg else "MemorySaver"
 
-            saver = PostgresSaver(self.store.db.pool)  # type: ignore[arg-type]
-            saver.setup()
-            return saver
-        return MemorySaver()
+    async def _ensure(self) -> None:
+        """The graph runs on the async path, so the checkpointer must be the async saver; it needs a running
+        loop to open its pool, hence the lazy build on the first step (once per process, then cached)."""
+        if self.graph is not None:
+            return
+        async with self._lock:
+            if self.graph is not None:
+                return
+            if self.store.db.pg:
+                from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+                from psycopg.rows import dict_row
+                from psycopg_pool import AsyncConnectionPool
+
+                self._pool = AsyncConnectionPool(
+                    self.store.db.url,
+                    min_size=0,
+                    max_size=4,
+                    open=False,
+                    kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row, "options": f"-c search_path={self.store.db.schema},public"},
+                )
+                await self._pool.open()
+                saver = AsyncPostgresSaver(self._pool)  # type: ignore[arg-type]
+                await saver.setup()
+            else:
+                saver = MemorySaver()
+            self.saver = saver
+            self.graph = self._build()
 
     def meeting(self, mid: str) -> Meeting:
         settings = current_settings.get(None) or Settings.from_env()
@@ -479,6 +504,7 @@ class Engine:
         return {"configurable": {"thread_id": mid}}
 
     async def step(self, mid: str, settings: Settings, resume: dict[str, Any] | None = None, first: bool = False) -> dict[str, Any]:
+        await self._ensure()
         token = current_settings.set(settings)
         try:
             cfg = self.config(mid)

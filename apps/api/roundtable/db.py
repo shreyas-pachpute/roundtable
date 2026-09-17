@@ -19,6 +19,7 @@ class DB:
     def __init__(self, url: str | None, sqlite_path: str | Path, schema: str):
         self.pg = bool(url and url.startswith(("postgres://", "postgresql://")))
         self.schema = schema
+        self.url = url
         if self.pg:
             from psycopg.rows import dict_row
             from psycopg_pool import ConnectionPool

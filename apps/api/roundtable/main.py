@@ -36,7 +36,7 @@ class HumanIn(BaseModel):
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
-    return {"ok": True, "db": store.db.label, "checkpointer": type(engine.saver).__name__}
+    return {"ok": True, "db": store.db.label, "checkpointer": engine.saver_label}
 
 
 @app.get("/api/settings")
